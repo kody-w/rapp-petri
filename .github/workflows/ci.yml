@@ -1,0 +1,32 @@
+name: petri
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  culture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the dish
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # No brainstem service, no credential, no runtime to match --
+      # the dish is a URL.
+      - name: Is it alive
+        run: python petri.py
+
+      - name: Map what answers unauthenticated
+        run: python petri.py --routes
+
+      - name: Culture the example agents
+        run: python petri.py --dir examples --json
