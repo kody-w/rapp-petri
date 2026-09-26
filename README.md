@@ -2,24 +2,24 @@
 
 Culture RAPP agents in a sterile, headless brainstem.
 
-`petri.py` boots the Pyodide [vBrainstem](https://kody-w.github.io/vbrainstem/)
-in headless Chromium and drops your agents into it. No install. No brainstem
-service. No credentials. No local Python for the agents themselves — the same
-runtime that answers on a real machine, running in a browser you never see.
+`petri.py` boots the browser [vBrainstem](https://kody-w.github.io/vbrainstem/)
+in headless Chromium and drops your agents into a synthetic vbrainstem file. No
+install. No brainstem service. No credentials. The same browser dispatch surface
+that answers on the live page, running in a browser you never see.
 
 ```console
 $ petri.py --dir ./agents
 petri: https://kody-w.github.io/vbrainstem/
-  alive in 4s — CPython 3.12.1, registry RAR, signed_in=False
+  alive in 1s — vbrainstem 1.0.0, status=unauthenticated, agents=0
 
 culturing 4 agent(s)
 
-  ok   knowledge_companion_agent.py             0.0s  KnowledgeCompanionAgent
-  ok   knowledge_ingest_agent.py                0.0s  KnowledgeIngestAgent
+  ok   knowledge_companion_agent.py             0.1s  KnowledgeCompanionAgent
+  ok   knowledge_ingest_agent.py                0.1s  KnowledgeIngestAgent
   ok   program_corpus_agent.py                  0.1s  ProgramCorpusAgent
-  ok   sharepoint_loader_agent.py               0.0s  SharePointLoaderAgent
+  ok   sharepoint_loader_agent.py               0.1s  SharePointLoaderAgent
 
-4/4 executed in one boot, total 4s
+4/4 discovered in one boot, total 1s
 ```
 
 Boot is paid once. Every agent after it costs milliseconds — which is the
@@ -32,15 +32,16 @@ A RAPP agent is a single `*_agent.py` with a typed contract and a `perform()`.
 Testing one has meant installing a brainstem, which means the test depends on
 the machine it runs on — and "works on mine" is not a result.
 
-The vBrainstem already solves the runtime half: it is the real brainstem
-compiled to WebAssembly, served as a static page. `rapp-petri` is the other
-half — the harness that drives it with no human in front of it, so a folder of
-agents can be executed and asserted from CI, a laptop with pip blocked, or a
-host that has no shell at all.
+The vBrainstem already solves the browser half: it is a static page with the
+same dispatch boundary the browser uses for `/health`, `/agents`, `/models`,
+and `/chat`. `rapp-petri` is the other half — the harness that drives it with no
+human in front of it, so a folder of agents can be asserted from CI, a laptop
+with pip blocked, or a host that has no shell at all.
 
-The agent never touches disk. Its source travels as a string into
-`brainstem_web.rapp_run()`, the same entry the brainstem uses after it resolves
-a registry slug.
+The agent never touches disk. Its source is embedded into a synthetic
+vbrainstem file under `## Storage`, the same place browser vBrainstem discovers
+tools a person's file carries. The gate fails if the dish does not boot or if an
+agent is not discovered by `/health`.
 
 ## Install
 
@@ -55,34 +56,18 @@ One file, one dependency.
 
 ```bash
 petri.py                                  # boot only — is the dish alive?
-petri.py --dir ./agents                   # run every *_agent.py in ONE boot
-petri.py --agent ship_agent.py --args '{"repo":"demo"}'
-petri.py --skill ship/SKILL.md --toaster toaster.py
+petri.py --dir ./agents                   # discover every *_agent.py in ONE boot
+petri.py --agent ship_agent.py
 petri.py --routes                         # map the brainstem HTTP surface
 petri.py --dir ./agents --json            # machine-readable, for CI
+petri.py --self-test-dead                 # prove a blank page is rejected
 ```
 
-Exit code is `0` only when every agent executed, so it gates a build directly.
-
-### SKILL.md in, agent out, in the browser
-
-[`rapp-toaster`](https://github.com/kody-w/rapp-toaster) is stdlib-only, so the
-whole conversion runs client-side too — a raw `SKILL.md` becomes an agent and
-executes without either file ever existing on disk:
-
-```console
-$ petri.py --skill ship/SKILL.md --toaster toaster.py --args '{"repo":"demo-site"}'
-  capability_id: ddd317502185
-  params: ['marker', 'repo', 'sensible_kebab_name', 'url']
-  steps: 9
-  agent_bytes: 13100
-  executed: True
-  ran_class: ShipAgent
-```
-
-That `capability_id` is the value the toaster reports for the same skill
-locally. The browser-built agent is not similar to the local one — it is the
-same capability.
+Exit code is `0` only when the dish boots and every supplied agent is discovered,
+so it gates a build directly. The retired Pyodide dish executed `perform()`
+inside the browser; current vBrainstem is a browser file/tool surface plus
+canonical chat dispatch, so unauthenticated CI checks discovery, not model
+execution.
 
 ## What answers without a credential
 
@@ -90,30 +75,23 @@ same capability.
 
 | route | | |
 |---|---|---|
-| `GET /health` | 200 | version, model, soul path, agents, quarantine list |
-| `GET /version` | 200 | `{"version":"0.6.16"}` |
-| `GET /agents` | 200 | the loaded agent files |
+| `GET /health` | 200 | version, model, soul state, agents, quarantine list |
+| `GET /agents` | 200 | the loaded factory and file-carried agents |
 | `GET /models` | 200 | gpt-4.1, gpt-4o, gpt-4o-mini, claude-sonnet-4, … |
-| `GET /diagnostics` | 200 | the real event log, timestamped |
-| `POST /chat` | **500** | `Not authenticated. Visit /login to sign in with GitHub.` |
+| `POST /chat` | 400/401 | asks for a file or sign-in before model chat |
 
 So the split is clean, and worth stating plainly rather than glossing:
 
-- **Agent execution and the entire read side of the brainstem need nothing.**
+- **Boot, read-side dispatch, and file-carried agent discovery need nothing.**
   That is the part CI can run on every push, with no secret.
-- **`/chat` — the model loop, routing, memory — needs a sign-in.** The route is
-  live; it wants a token. `/login` and `/login/poll` are a device-code flow, so
-  it is scriptable, but it is not free.
-
-Known gap: `POST /surgeon/complete` returns an nginx `405`, not a brainstem
-JSON error — the request escapes the in-page interceptor and hits the static
-host. That route is in the brainstem's table but is not currently served
-in-browser.
+- **`/chat` — the model loop, routing, memory — needs a file and usually a
+  sign-in.** The route is live; it wants the same context the page needs.
 
 ## CI
 
 ```yaml
 - run: pip install playwright && playwright install --with-deps chromium
+- run: python petri.py --self-test-dead
 - run: python petri.py --dir ./agents
 ```
 
@@ -124,23 +102,20 @@ URL.
 
 ```
 petri.py ──▶ headless Chromium ──▶ kody-w.github.io/vbrainstem
-                                      └─ Web Worker
-                                          └─ Pyodide ── CPython 3.12
-                                              └─ brainstem_web.rapp_run(source, …)
+                                      └─ window.vbrainstem.dispatch
+                                          ├─ GET /health
+                                          ├─ GET /agents
+                                          └─ synthetic file Storage agent discovery
 ```
 
-The worker takes the agent source as a string, scans it for pip dependencies,
-installs them, `exec`s it, finds the `BasicAgent` subclass and calls `perform`.
-Scratch files land outside `agents/`, so a cultured agent never leaks into a
-later conversation.
-
-Agent source is UTF-8 encoded before base64 on the way in — `btoa` is latin-1
-only, and agents are full of em dashes.
+`petri.py` builds a temporary vbrainstem file in browser storage, places each
+agent source under `## Storage`, and asks the page's own `/health` dispatch what
+agents it can see. A cultured agent never writes to the repository or to a real
+Brainstem folder.
 
 ## Related
 
-- [vbrainstem](https://github.com/kody-w/vbrainstem) — the brainstem in Pyodide
-- [rapp-toaster](https://github.com/kody-w/rapp-toaster) — SKILL.md ⇄ agent.py
+- [vbrainstem](https://github.com/kody-w/vbrainstem) — the browser Brainstem file surface
 - [rapp-skills](https://github.com/kody-w/rapp-skills) — portable skills, each
   shipping the agent it converts to
 
