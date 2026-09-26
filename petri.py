@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""rapp-petri — culture RAPP agents in a sterile, headless brainstem.
+"""rapp-petri — culture RAPP agents in a sterile, headless vbrainstem.
 
-Boots the Pyodide vBrainstem from a URL in headless Chromium, then drops agents
-into it. No install, no local Python for the agents, no brainstem service, no
-credentials. Same runtime that answers on a real machine.
+Boots the browser vBrainstem from a URL in headless Chromium, then drops agents
+into a synthetic vbrainstem file. No install, no brainstem service, no
+credentials. Same dispatch surface the live page uses.
 
     petri.py                              boot only -- is the dish alive?
-    petri.py --dir ./agents               run every *_agent.py in ONE boot
-    petri.py --agent ship_agent.py        run one, with --args '{...}'
-    petri.py --skill ship/SKILL.md \
-             --toaster toaster.py         SKILL.md -> agent.py -> run, in-browser
+    petri.py --dir ./agents               discover every *_agent.py in ONE boot
+    petri.py --agent ship_agent.py        discover one agent
     petri.py --routes                     map the brainstem's HTTP surface
+    petri.py --self-test-dead             prove a blank page is rejected
 
-Boot costs ~20-40s once; every agent after that is fast, which is what makes
---dir usable as a test suite rather than a demo.
+Boot costs once; every agent after that is fast, which is what makes --dir
+usable as a test suite rather than a demo.
 
-Exit code is 0 only if every agent executed. Non-zero is a usable CI gate.
+Exit code is 0 only if the dish boots and every supplied agent is discovered.
+Non-zero is a usable CI gate.
 """
 
 from __future__ import annotations
@@ -23,84 +23,34 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import http.server
 import re
 import sys
 import time
+import threading
 from pathlib import Path
 
 VBRAINSTEM = "https://kody-w.github.io/vbrainstem/"
 
-GENERATED_BLOCK = re.compile(
-    r"\n?^<!-- toaster:generated:begin -->$.*?^<!-- toaster:generated:end -->$\n?",
-    re.S | re.M,
-)
-CAPSULE = re.compile(r"\n?^<!-- rci-capsule:v1:[^>]*-->$\n?", re.S | re.M)
-
-# ---- Python that runs INSIDE the dish ------------------------------------
-# rapp.eval sends multi-line code through exec(), which discards a trailing
-# expression, so every result is printed rather than returned.
-
-RUN_AGENT = """
-import base64, json, brainstem_web
-_src = base64.b64decode(AGENT_B64).decode("utf-8")
-_out = brainstem_web.rapp_run(_src, AGENT_NAME, REQUEST, ARGS_OBJ)
-print(json.dumps({
-    "executed": _out.get("executed"),
-    "ran_class": _out.get("ran_class"),
-    "output": (_out.get("output") or _out.get("error") or "")[:4000],
-    "trace": (_out.get("trace") or "")[:600],
-}))
-"""
-
-BUILD_AND_RUN = """
-import base64, importlib.util, json, os, sys, brainstem_web
-os.makedirs("/tmp/tk", exist_ok=True)
-open("/tmp/tk/toaster.py", "w").write(base64.b64decode(TOASTER_B64).decode())
-open("/tmp/tk/SKILL.md", "w").write(base64.b64decode(SKILL_B64).decode())
-spec = importlib.util.spec_from_file_location("toaster", "/tmp/tk/toaster.py")
-tk = importlib.util.module_from_spec(spec); spec.loader.exec_module(tk)
-rci = tk.load("/tmp/tk/SKILL.md", "skill")
-# Drop the vaulted raw copy or render() restores the bytes we are replacing and
-# the toast silently no-ops -- the rule `toaster.py toast` follows.
-rci.setdefault("preserved", {}).pop("skill", None)
-tk.toast_rci(rci)
-agent_src = tk.render(rci, "agent").decode()
-_out = brainstem_web.rapp_run(agent_src, rci["name"], REQUEST, ARGS_OBJ)
-print(json.dumps({
-    "capability_id": tk.capability_id(rci)[:12],
-    "params": sorted((rci.get("parameters") or {}).get("properties", {})),
-    "steps": len((rci.get("impl") or {}).get("steps") or []),
-    "agent_bytes": len(agent_src),
-    "executed": _out.get("executed"),
-    "ran_class": _out.get("ran_class"),
-    "output": (_out.get("output") or _out.get("error") or "")[:4000],
-}))
-"""
-
-# btoa is latin-1 only, so source is UTF-8 encoded before base64 -- otherwise a
-# single em dash breaks the round trip, and agents are full of them.
-EVAL_JS = """
-async ({code, consts}) => {
-  const enc = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
-  let head = '';
-  for (const [k, v] of Object.entries(consts)) {
-    head += (typeof v === 'string' && k.endsWith('_B64'))
-      ? `${k} = "${enc(v)}"\\n`
-      : `${k} = json.loads(${JSON.stringify(JSON.stringify(v))})\\n`;
-  }
-  return await window.rapp.eval('import json\\n' + head + code);
-}
-"""
-
-
 async def open_dish(page, timeout_s: int) -> dict | None:
     await page.goto(VBRAINSTEM, wait_until="domcontentloaded", timeout=90_000)
-    await page.wait_for_function("() => !!window.rapp", timeout=120_000)
+    try:
+        await page.wait_for_function(
+            "() => !!(window.vbrainstem && window.vbrainstem.dispatch)",
+            timeout=min(max(timeout_s, 5) * 1000, 120_000),
+        )
+    except Exception:
+        return None
     return await page.evaluate(
         """async (tries) => {
              for (let i = 0; i < tries; i++) {
-               try { const h = await window.rapp.health();
-                     if (h && h.status === 'ok') return h; } catch (e) {}
+               try {
+                 const r = await window.vbrainstem.dispatch('GET', '/health');
+                 if (r && r.status === 200 && r.json &&
+                     (r.json.status === 'ok' || r.json.status === 'unauthenticated')) {
+                   return r.json;
+                 }
+               } catch (e) {}
                await new Promise(r => setTimeout(r, 2000));
              }
              return null;
@@ -109,23 +59,112 @@ async def open_dish(page, timeout_s: int) -> dict | None:
     )
 
 
-async def culture(page, code: str, consts: dict) -> dict:
-    """Run one specimen in the dish and parse what it printed."""
-    raw = await page.evaluate(EVAL_JS, {"code": code, "consts": consts})
-    out = (raw or {}).get("output", "").strip()
-    if not out:
-        return {"executed": False, "output": "runtime returned nothing"}
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return {"executed": False, "output": out[:1000]}
-
-
 def specimens(target: Path) -> list[Path]:
     if target.is_file():
         return [target]
     found = sorted(p for p in target.rglob("*_agent.py") if "__pycache__" not in p.parts)
     return found
+
+
+def agent_name(source: str) -> str:
+    for match in re.finditer(r"self\.name\s*=\s*(['\"])([^'\"\n{}]+)\1", source):
+        return match.group(2)
+    return ""
+
+
+def fence(source: str) -> str:
+    ticks = max((len(m.group(0)) for m in re.finditer(r"`+", source)), default=2) + 1
+    mark = "`" * max(3, ticks)
+    return f"{mark}python\n{source.rstrip()}\n{mark}"
+
+
+def person_file(files: list[Path]) -> tuple[str, list[dict]]:
+    entries = []
+    blocks = []
+    for path in files:
+        source = path.read_text(encoding="utf-8")
+        name = agent_name(source)
+        if not name:
+            entries.append({"agent": path.name, "discovered": False, "output": "no plain self.name assignment"})
+            continue
+        entries.append({"agent": path.name, "expected": name, "discovered": False})
+        blocks.append(f"### agents/{path.name}\n\n{fence(source)}\n")
+    today = time.strftime("%Y-%m-%d")
+    text = "\n".join([
+        "---",
+        'name: "petri"',
+        'description: "Synthetic petri dish file."',
+        'license: "MIT"',
+        'compatibility: "vbrainstem"',
+        "metadata:",
+        '  id: "vb-petri"',
+        '  owner: "rapp-petri"',
+        f'  created: "{today}"',
+        f'  updated: "{today}"',
+        "---",
+        "",
+        "# Petri",
+        "",
+        "## Who I am",
+        "",
+        "A sterile CI file for testing vbrainstem tool discovery.",
+        "",
+        "## My tools",
+        "",
+        "- (none)",
+        "",
+        "## Memory",
+        "",
+        "- (nothing yet)",
+        "",
+        "## Memory (older)",
+        "",
+        "- (nothing yet)",
+        "",
+        "## Storage",
+        "",
+        *blocks,
+    ])
+    return text, entries
+
+
+async def culture_files(page, files: list[Path]) -> list[dict]:
+    text, report = person_file(files)
+    await page.evaluate(
+        """async (text) => {
+             localStorage.clear();
+             localStorage.setItem('vbrainstem.file', text);
+           }""",
+        text,
+    )
+    health = await page.evaluate(
+        """async () => (await window.vbrainstem.dispatch('GET', '/health')).json"""
+    )
+    agents = set(health.get("agents") or [])
+    for item in report:
+        expected = item.get("expected")
+        if expected:
+            item["discovered"] = expected in agents
+            item["output"] = "listed in /health" if item["discovered"] else "not listed in /health"
+    return report
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+
+def blank_server() -> tuple[http.server.ThreadingHTTPServer, str]:
+    class Handler(QuietHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><title>blank</title><p>no dish</p>")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}/"
 
 
 async def main() -> int:
@@ -140,6 +179,8 @@ async def main() -> int:
     ap.add_argument("--name", default="Agent", help="display name for --agent")
     ap.add_argument("--routes", action="store_true",
                     help="map which brainstem HTTP routes answer unauthenticated")
+    ap.add_argument("--self-test-dead", action="store_true",
+                    help="prove a page without vbrainstem dispatch fails the boot check")
     ap.add_argument("--url", default=VBRAINSTEM)
     ap.add_argument("--boot-timeout", type=int, default=300)
     ap.add_argument("--json", action="store_true", help="emit machine-readable results")
@@ -148,6 +189,13 @@ async def main() -> int:
     if opts.skill and not opts.toaster:
         print("--skill needs --toaster (github.com/kody-w/rapp-toaster)", file=sys.stderr)
         return 2
+    if opts.self_test_dead:
+        server, url = blank_server()
+        try:
+            opts.url = url
+            opts.boot_timeout = min(opts.boot_timeout, 5)
+        finally:
+            pass
 
     try:
         from playwright.async_api import async_playwright
@@ -167,11 +215,17 @@ async def main() -> int:
             print(f"petri: {opts.url}")
             health = await open_dish(page, opts.boot_timeout)
             if not health:
+                if opts.self_test_dead:
+                    print("SELF-TEST OK: a blank page was rejected as dead")
+                    return 0
                 print("DEAD: the dish never came up")
                 return 1
-            print(f"  alive in {time.time() - t0:.0f}s — CPython "
-                  f"{health['runtime'].split()[-1]}, registry {health['registry']}, "
-                  f"signed_in={health['signed_in']}\n")
+            print(f"  alive in {time.time() - t0:.0f}s — vbrainstem {health.get('version')}, "
+                  f"status={health.get('status')}, agents={len(health.get('agents') or [])}\n")
+
+            if opts.self_test_dead:
+                print("SELF-TEST FAILED: a blank page was accepted as a dish", file=sys.stderr)
+                return 1
 
             if opts.routes:
                 results = await page.evaluate(
@@ -179,15 +233,13 @@ async def main() -> int:
                          const gets = ['/health','/version','/agents','/models','/diagnostics'];
                          const out = [];
                          for (const path of gets) {
-                           try { const r = await fetch(path);
-                                 out.push({path, status:r.status, body:(await r.text()).slice(0,150)}); }
+                           try { const r = await window.vbrainstem.dispatch('GET', path);
+                                 out.push({path, status:r.status, body:JSON.stringify(r.json).slice(0,150)}); }
                            catch (e) { out.push({path, status:'ERR', body:String(e).slice(0,120)}); }
                          }
                          try {
-                           const r = await fetch('/chat', {method:'POST',
-                             headers:{'Content-Type':'application/json'},
-                             body: JSON.stringify({user_input:'ping', conversation_history:[]})});
-                           out.push({path:'/chat', status:r.status, body:(await r.text()).slice(0,150)});
+                           const r = await window.vbrainstem.dispatch('POST', '/chat', {user_input:'ping', conversation_history:[]});
+                           out.push({path:'/chat', status:r.status, body:JSON.stringify(r.json).slice(0,150)});
                          } catch (e) { out.push({path:'/chat', status:'ERR', body:String(e).slice(0,120)}); }
                          return out;
                        }"""
@@ -197,63 +249,41 @@ async def main() -> int:
                 return 0
 
             if opts.skill:
-                text = Path(opts.skill).read_text(encoding="utf-8")
-                res = await culture(page, BUILD_AND_RUN, {
-                    "TOASTER_B64": Path(opts.toaster).read_text(encoding="utf-8"),
-                    "SKILL_B64": CAPSULE.sub("", GENERATED_BLOCK.sub("", text)),
-                    "REQUEST": opts.request, "ARGS_OBJ": args_obj,
-                })
-                if opts.json:
-                    print(json.dumps(res, indent=2))
-                else:
-                    for k in ("capability_id", "params", "steps", "agent_bytes",
-                              "executed", "ran_class"):
-                        if k in res:
-                            print(f"  {k}: {res[k]}")
-                    print("  output:")
-                    for line in str(res.get("output", "")).splitlines()[:25]:
-                        print("    " + line)
-                return 0 if res.get("executed") else 1
+                print("--skill conversion belonged to the retired Pyodide dish; current vbrainstem exposes file/tool discovery and canonical chat dispatch.", file=sys.stderr)
+                return 2
 
-            target = Path(opts.dir or opts.agent or ".").expanduser()
+            if not (opts.dir or opts.agent):
+                return 0
+
+            target = Path(opts.dir or opts.agent).expanduser()
             files = specimens(target)
             if not files:
                 print(f"no *_agent.py under {target}", file=sys.stderr)
                 return 1
 
             print(f"culturing {len(files)} agent(s)\n")
-            report, failed = [], 0
-            for path in files:
-                started = time.time()
-                res = await culture(page, RUN_AGENT, {
-                    "AGENT_B64": path.read_text(encoding="utf-8"),
-                    "AGENT_NAME": opts.name if opts.agent else path.stem,
-                    "REQUEST": opts.request,
-                    "ARGS_OBJ": args_obj,
-                })
-                took = time.time() - started
-                ok = bool(res.get("executed"))
-                failed += 0 if ok else 1
-                report.append({"agent": path.name, "executed": ok,
-                               "ran_class": res.get("ran_class"),
-                               "seconds": round(took, 1),
-                               "output": res.get("output", "")[:2000]})
-                if not opts.json:
-                    mark = "ok  " if ok else "FAIL"
-                    print(f"  {mark} {path.name:<38} {took:5.1f}s  "
-                          f"{res.get('ran_class') or ''}")
-                    if not ok:
-                        for line in str(res.get("output", "")).splitlines()[:6]:
-                            print("         " + line)
+            started = time.time()
+            report = await culture_files(page, files)
+            failed = len([item for item in report if not item.get("discovered")])
+            took = time.time() - started
+            if not opts.json:
+                for item in report:
+                    mark = "ok  " if item.get("discovered") else "FAIL"
+                    print(f"  {mark} {item['agent']:<38} {took:5.1f}s  "
+                          f"{item.get('expected') or ''}")
+                    if not item.get("discovered"):
+                        print("         " + item.get("output", "not discovered"))
 
             if opts.json:
                 print(json.dumps({"url": opts.url, "agents": report,
                                   "failed": failed}, indent=2))
             else:
-                print(f"\n{len(files) - failed}/{len(files)} executed "
+                print(f"\n{len(files) - failed}/{len(files)} discovered "
                       f"in one boot, total {time.time() - t0:.0f}s")
             return 1 if failed else 0
         finally:
+            if opts.self_test_dead:
+                server.shutdown()
             await browser.close()
 
 
