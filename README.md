@@ -1,5 +1,9 @@
 # rapp-petri
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-petri.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-petri.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 Culture RAPP agents in a sterile, headless brainstem.
 
 `petri.py` boots the browser [vBrainstem](https://kody-w.github.io/vbrainstem/)
